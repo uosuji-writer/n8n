@@ -1,5 +1,5 @@
 import { getAdditionalKeys } from 'n8n-core';
-import { WorkflowDataProxy, Workflow } from 'n8n-workflow';
+import { WorkflowDataProxy, Workflow, ObservableObject } from 'n8n-workflow';
 import type {
 	CodeExecutionMode,
 	IWorkflowExecuteAdditionalData,
@@ -19,7 +19,12 @@ import * as a from 'node:assert';
 import { runInNewContext, type Context } from 'node:vm';
 
 import type { MainConfig } from '@/config/main-config';
-import type { DataRequestResponse, PartialAdditionalData, TaskResultData } from '@/runner-types';
+import type {
+	DataRequestResponse,
+	InputDataChunkDefinition,
+	PartialAdditionalData,
+	TaskResultData,
+} from '@/runner-types';
 import { type Task, TaskRunner } from '@/task-runner';
 
 import { BuiltInsParser } from './built-ins-parser/built-ins-parser';
@@ -27,6 +32,7 @@ import { BuiltInsParserState } from './built-ins-parser/built-ins-parser-state';
 import { isErrorLike } from './errors/error-like';
 import { ExecutionError } from './errors/execution-error';
 import { makeSerializable } from './errors/serializable-error';
+import { TimeoutError } from './errors/timeout-error';
 import type { RequireResolver } from './require-resolver';
 import { createRequireResolver } from './require-resolver';
 import { validateRunForAllItemsOutput, validateRunForEachItemOutput } from './result-validation';
@@ -37,9 +43,8 @@ export interface JSExecSettings {
 	nodeMode: CodeExecutionMode;
 	workflowMode: WorkflowExecuteMode;
 	continueOnFail: boolean;
-
-	// For workflow data proxy
-	mode: WorkflowExecuteMode;
+	// For executing partial input data
+	chunk?: InputDataChunkDefinition;
 }
 
 export interface JsTaskData {
@@ -90,9 +95,11 @@ export class JsTaskRunner extends TaskRunner {
 		});
 	}
 
-	async executeTask(task: Task<JSExecSettings>): Promise<TaskResultData> {
+	async executeTask(task: Task<JSExecSettings>, signal: AbortSignal): Promise<TaskResultData> {
 		const settings = task.settings;
 		a.ok(settings, 'JS Code not sent to runner');
+
+		this.validateTaskSettings(settings);
 
 		const neededBuiltInsResult = this.builtInsParser.parseUsedBuiltIns(settings.code);
 		const neededBuiltIns = neededBuiltInsResult.ok
@@ -101,10 +108,10 @@ export class JsTaskRunner extends TaskRunner {
 
 		const dataResponse = await this.requestData<DataRequestResponse>(
 			task.taskId,
-			neededBuiltIns.toDataRequestParams(),
+			neededBuiltIns.toDataRequestParams(settings.chunk),
 		);
 
-		const data = this.reconstructTaskData(dataResponse);
+		const data = this.reconstructTaskData(dataResponse, settings.chunk);
 
 		await this.requestNodeTypeIfNeeded(neededBuiltIns, data.workflow, task.taskId);
 
@@ -114,7 +121,13 @@ export class JsTaskRunner extends TaskRunner {
 			nodeTypes: this.nodeTypes,
 		});
 
+		const noOp = () => {};
 		const customConsole = {
+			// all except `log` are dummy methods that disregard without throwing, following existing Code node behavior
+			...Object.keys(console).reduce<Record<string, () => void>>((acc, name) => {
+				acc[name] = noOp;
+				return acc;
+			}, {}),
 			// Send log output back to the main process. It will take care of forwarding
 			// it to the UI or printing to console.
 			log: (...args: unknown[]) => {
@@ -125,15 +138,26 @@ export class JsTaskRunner extends TaskRunner {
 			},
 		};
 
+		workflow.staticData = ObservableObject.create(workflow.staticData);
+
 		const result =
 			settings.nodeMode === 'runOnceForAllItems'
-				? await this.runForAllItems(task.taskId, settings, data, workflow, customConsole)
-				: await this.runForEachItem(task.taskId, settings, data, workflow, customConsole);
+				? await this.runForAllItems(task.taskId, settings, data, workflow, customConsole, signal)
+				: await this.runForEachItem(task.taskId, settings, data, workflow, customConsole, signal);
 
 		return {
 			result,
 			customData: data.runExecutionData.resultData.metadata,
+			staticData: workflow.staticData.__dataChanged ? workflow.staticData : undefined,
 		};
+	}
+
+	private validateTaskSettings(settings: JSExecSettings) {
+		a.ok(settings.code, 'No code to execute');
+
+		if (settings.nodeMode === 'runOnceForAllItems') {
+			a.ok(settings.chunk === undefined, 'Chunking is not supported for runOnceForAllItems');
+		}
 	}
 
 	private getNativeVariables() {
@@ -169,6 +193,7 @@ export class JsTaskRunner extends TaskRunner {
 		data: JsTaskData,
 		workflow: Workflow,
 		customConsole: CustomConsole,
+		signal: AbortSignal,
 	): Promise<INodeExecutionData[]> {
 		const dataProxy = this.createDataProxy(data, workflow, data.itemIndex);
 		const inputItems = data.connectionInputData;
@@ -178,17 +203,33 @@ export class JsTaskRunner extends TaskRunner {
 			module: {},
 			console: customConsole,
 			items: inputItems,
-
+			$getWorkflowStaticData: (type: 'global' | 'node') => workflow.getStaticData(type, data.node),
 			...this.getNativeVariables(),
 			...dataProxy,
 			...this.buildRpcCallObject(taskId),
 		};
 
 		try {
-			const result = (await runInNewContext(
-				`globalThis.global = globalThis; module.exports = async function VmCodeWrapper() {${settings.code}\n}()`,
-				context,
-			)) as TaskResultData['result'];
+			const result = await new Promise<TaskResultData['result']>((resolve, reject) => {
+				const abortHandler = () => {
+					reject(new TimeoutError(this.taskTimeout));
+				};
+
+				signal.addEventListener('abort', abortHandler, { once: true });
+
+				const taskResult = runInNewContext(
+					`globalThis.global = globalThis; module.exports = async function VmCodeWrapper() {${settings.code}\n}()`,
+					context,
+					{ timeout: this.taskTimeout * 1000 },
+				) as Promise<TaskResultData['result']>;
+
+				void taskResult
+					.then(resolve)
+					.catch(reject)
+					.finally(() => {
+						signal.removeEventListener('abort', abortHandler);
+					});
+			});
 
 			if (result === null) {
 				return [];
@@ -216,11 +257,18 @@ export class JsTaskRunner extends TaskRunner {
 		data: JsTaskData,
 		workflow: Workflow,
 		customConsole: CustomConsole,
+		signal: AbortSignal,
 	): Promise<INodeExecutionData[]> {
 		const inputItems = data.connectionInputData;
 		const returnData: INodeExecutionData[] = [];
 
-		for (let index = 0; index < inputItems.length; index++) {
+		// If a chunk was requested, only process the items in the chunk
+		const chunkStartIdx = settings.chunk ? settings.chunk.startIndex : 0;
+		const chunkEndIdx = settings.chunk
+			? settings.chunk.startIndex + settings.chunk.count
+			: inputItems.length;
+
+		for (let index = chunkStartIdx; index < chunkEndIdx; index++) {
 			const item = inputItems[index];
 			const dataProxy = this.createDataProxy(data, workflow, index);
 			const context: Context = {
@@ -228,17 +276,34 @@ export class JsTaskRunner extends TaskRunner {
 				module: {},
 				console: customConsole,
 				item,
-
+				$getWorkflowStaticData: (type: 'global' | 'node') =>
+					workflow.getStaticData(type, data.node),
 				...this.getNativeVariables(),
 				...dataProxy,
 				...this.buildRpcCallObject(taskId),
 			};
 
 			try {
-				let result = (await runInNewContext(
-					`module.exports = async function VmCodeWrapper() {${settings.code}\n}()`,
-					context,
-				)) as INodeExecutionData | undefined;
+				let result = await new Promise<INodeExecutionData | undefined>((resolve, reject) => {
+					const abortHandler = () => {
+						reject(new TimeoutError(this.taskTimeout));
+					};
+
+					signal.addEventListener('abort', abortHandler);
+
+					const taskResult = runInNewContext(
+						`module.exports = async function VmCodeWrapper() {${settings.code}\n}()`,
+						context,
+						{ timeout: this.taskTimeout * 1000 },
+					) as Promise<INodeExecutionData>;
+
+					void taskResult
+						.then(resolve)
+						.catch(reject)
+						.finally(() => {
+							signal.removeEventListener('abort', abortHandler);
+						});
+				});
 
 				// Filter out null values
 				if (result === null) {
@@ -325,13 +390,24 @@ export class JsTaskRunner extends TaskRunner {
 		return new ExecutionError({ message: JSON.stringify(error) });
 	}
 
-	private reconstructTaskData(response: DataRequestResponse): JsTaskData {
+	private reconstructTaskData(
+		response: DataRequestResponse,
+		chunk?: InputDataChunkDefinition,
+	): JsTaskData {
+		const inputData = this.taskDataReconstruct.reconstructConnectionInputItems(
+			response.inputData,
+			chunk,
+			// This type assertion is intentional. Chunking is only supported in
+			// runOnceForEachItem mode and if a chunk was requested, we intentionally
+			// fill the array with undefined values for the items outside the chunk.
+			// We only iterate over the chunk items but WorkflowDataProxy expects
+			// the full array of items.
+		) as INodeExecutionData[];
+
 		return {
 			...response,
-			connectionInputData: this.taskDataReconstruct.reconstructConnectionInputData(
-				response.inputData,
-			),
-			executeData: this.taskDataReconstruct.reconstructExecuteData(response),
+			connectionInputData: inputData,
+			executeData: this.taskDataReconstruct.reconstructExecuteData(response, inputData),
 		};
 	}
 

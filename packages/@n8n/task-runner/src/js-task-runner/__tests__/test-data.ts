@@ -16,7 +16,6 @@ export const newTaskWithSettings = (
 	settings: {
 		workflowMode: 'manual',
 		continueOnFail: false,
-		mode: 'manual',
 		...settings,
 	},
 	active: true,
@@ -51,7 +50,9 @@ export const newTaskData = (opts: Partial<ITaskData> & Pick<ITaskData, 'source'>
  */
 export const newDataRequestResponse = (
 	inputData: INodeExecutionData[],
-	opts: Partial<DataRequestResponse> = {},
+	opts: Partial<DataRequestResponse> & {
+		staticData?: IDataObject;
+	} = {},
 ): DataRequestResponse => {
 	const codeNode = newNode({
 		name: 'JsCode',
@@ -82,6 +83,7 @@ export const newDataRequestResponse = (
 				},
 			},
 			nodes: [manualTriggerNode, codeNode],
+			staticData: opts.staticData,
 		},
 		inputData: {
 			main: [inputData],

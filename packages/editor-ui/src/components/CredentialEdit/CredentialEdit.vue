@@ -759,7 +759,10 @@ const createToastMessagingForNewCredentials = (
 		toastText = i18n.baseText('credentials.create.personal.toast.text');
 	}
 
-	if (projectsStore.currentProject) {
+	if (
+		projectsStore.currentProject &&
+		projectsStore.currentProject.id !== projectsStore.personalProject?.id
+	) {
 		toastTitle = i18n.baseText('credentials.create.project.toast.title', {
 			interpolate: { projectName: project?.name ?? '' },
 		});
@@ -1067,7 +1070,7 @@ function resetCredentialData(): void {
 				<div :class="$style.credActions">
 					<n8n-icon-button
 						v-if="currentCredential && credentialPermissions.delete"
-						:title="$locale.baseText('credentialEdit.credentialEdit.delete')"
+						:title="i18n.baseText('credentialEdit.credentialEdit.delete')"
 						icon="trash"
 						type="tertiary"
 						:disabled="isSaving"
@@ -1081,8 +1084,8 @@ function resetCredentialData(): void {
 						:is-saving="isSaving || isTesting"
 						:saving-label="
 							isTesting
-								? $locale.baseText('credentialEdit.credentialEdit.testing')
-								: $locale.baseText('credentialEdit.credentialEdit.saving')
+								? i18n.baseText('credentialEdit.credentialEdit.testing')
+								: i18n.baseText('credentialEdit.credentialEdit.saving')
 						"
 						data-test-id="credential-save-button"
 						@click="saveCredential"

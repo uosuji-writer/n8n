@@ -1,11 +1,14 @@
-import { ApplicationError, ensureError } from 'n8n-workflow';
+import { ApplicationError, ensureError, randomInt } from 'n8n-workflow';
 import { nanoid } from 'nanoid';
+import { EventEmitter } from 'node:events';
 import { type MessageEvent, WebSocket } from 'ws';
 
 import type { BaseRunnerConfig } from '@/config/base-runner-config';
 import type { BrokerMessage, RunnerMessage } from '@/message-types';
 import { TaskRunnerNodeTypes } from '@/node-types';
 import { RPC_ALLOW_LIST, type TaskResultData } from '@/runner-types';
+
+import { TaskCancelledError } from './js-task-runner/errors/task-cancelled-error';
 
 export interface Task<T = unknown> {
 	taskId: string;
@@ -20,12 +23,14 @@ export interface TaskOffer {
 }
 
 interface DataRequest {
+	taskId: string;
 	requestId: string;
 	resolve: (data: unknown) => void;
 	reject: (error: unknown) => void;
 }
 
 interface NodeTypesRequest {
+	taskId: string;
 	requestId: string;
 	resolve: (data: unknown) => void;
 	reject: (error: unknown) => void;
@@ -41,15 +46,18 @@ export interface RPCCallObject {
 	[name: string]: ((...args: unknown[]) => Promise<unknown>) | RPCCallObject;
 }
 
-const VALID_TIME_MS = 1000;
-const VALID_EXTRA_MS = 100;
+const OFFER_VALID_TIME_MS = 5000;
+const OFFER_VALID_EXTRA_MS = 100;
+
+/** Converts milliseconds to nanoseconds */
+const msToNs = (ms: number) => BigInt(ms * 1_000_000);
 
 export interface TaskRunnerOpts extends BaseRunnerConfig {
 	taskType: string;
 	name?: string;
 }
 
-export abstract class TaskRunner {
+export abstract class TaskRunner extends EventEmitter {
 	id: string = nanoid();
 
 	ws: WebSocket;
@@ -76,12 +84,27 @@ export abstract class TaskRunner {
 
 	name: string;
 
+	private idleTimer: NodeJS.Timeout | undefined;
+
+	/** How long (in seconds) a task is allowed to take for completion, else the task will be aborted. */
+	protected readonly taskTimeout: number;
+
+	/** How long (in seconds) a runner may be idle for before exit. */
+	private readonly idleTimeout: number;
+
+	protected taskCancellations = new Map<Task['taskId'], AbortController>();
+
 	constructor(opts: TaskRunnerOpts) {
+		super();
 		this.taskType = opts.taskType;
 		this.name = opts.name ?? 'Node.js Task Runner SDK';
 		this.maxConcurrency = opts.maxConcurrency;
+		this.taskTimeout = opts.taskTimeout;
+		this.idleTimeout = opts.idleTimeout;
 
-		const wsUrl = `ws://${opts.n8nUri}/runners/_ws?id=${this.id}`;
+		const { host: taskBrokerHost } = new URL(opts.taskBrokerUri);
+
+		const wsUrl = `ws://${taskBrokerHost}/runners/_ws?id=${this.id}`;
 		this.ws = new WebSocket(wsUrl, {
 			headers: {
 				authorization: `Bearer ${opts.grantToken}`,
@@ -98,16 +121,27 @@ export abstract class TaskRunner {
 				['ECONNREFUSED', 'ENOTFOUND'].some((code) => code === error.code)
 			) {
 				console.error(
-					`Error: Failed to connect to n8n. Please ensure n8n is reachable at: ${opts.n8nUri}`,
+					`Error: Failed to connect to n8n task broker. Please ensure n8n task broker is reachable at: ${taskBrokerHost}`,
 				);
 				process.exit(1);
 			} else {
-				console.error(`Error: Failed to connect to n8n at ${opts.n8nUri}`);
+				console.error(`Error: Failed to connect to n8n task broker at ${taskBrokerHost}`);
 				console.error('Details:', event.message || 'Unknown error');
 			}
 		});
 		this.ws.addEventListener('message', this.receiveMessage);
 		this.ws.addEventListener('close', this.stopTaskOffers);
+		this.resetIdleTimer();
+	}
+
+	private resetIdleTimer() {
+		if (this.idleTimeout === 0) return;
+
+		this.clearIdleTimer();
+
+		this.idleTimer = setTimeout(() => {
+			if (this.runningTasks.size === 0) this.emit('runner:reached-idle-timeout');
+		}, this.idleTimeout * 1000);
 	}
 
 	private receiveMessage = (message: MessageEvent) => {
@@ -148,16 +182,20 @@ export abstract class TaskRunner {
 			(Object.values(this.openOffers).length + Object.values(this.runningTasks).length);
 
 		for (let i = 0; i < offersToSend; i++) {
+			// Add a bit of randomness so that not all offers expire at the same time
+			const validForInMs = OFFER_VALID_TIME_MS + randomInt(500);
+			// Add a little extra time to account for latency
+			const validUntil = process.hrtime.bigint() + msToNs(validForInMs + OFFER_VALID_EXTRA_MS);
 			const offer: TaskOffer = {
 				offerId: nanoid(),
-				validUntil: process.hrtime.bigint() + BigInt((VALID_TIME_MS + VALID_EXTRA_MS) * 1_000_000), // Adding a little extra time to account for latency
+				validUntil,
 			};
 			this.openOffers.set(offer.offerId, offer);
 			this.send({
 				type: 'runner:taskoffer',
 				taskType: this.taskType,
 				offerId: offer.offerId,
-				validFor: VALID_TIME_MS,
+				validFor: validForInMs,
 			});
 		}
 	}
@@ -182,7 +220,7 @@ export abstract class TaskRunner {
 				this.offerAccepted(message.offerId, message.taskId);
 				break;
 			case 'broker:taskcancel':
-				this.taskCancelled(message.taskId);
+				this.taskCancelled(message.taskId, message.reason);
 				break;
 			case 'broker:tasksettings':
 				void this.receivedSettings(message.taskId, message.settings);
@@ -244,6 +282,7 @@ export abstract class TaskRunner {
 			this.openOffers.delete(offerId);
 		}
 
+		this.resetIdleTimer();
 		this.runningTasks.set(taskId, {
 			taskId,
 			active: false,
@@ -256,17 +295,35 @@ export abstract class TaskRunner {
 		});
 	}
 
-	taskCancelled(taskId: string) {
+	taskCancelled(taskId: string, reason: string) {
 		const task = this.runningTasks.get(taskId);
 		if (!task) {
 			return;
 		}
 		task.cancelled = true;
-		if (task.active) {
-			// TODO
-		} else {
-			this.runningTasks.delete(taskId);
+
+		for (const [requestId, request] of this.dataRequests.entries()) {
+			if (request.taskId === taskId) {
+				request.reject(new TaskCancelledError(reason));
+				this.dataRequests.delete(requestId);
+			}
 		}
+
+		for (const [requestId, request] of this.nodeTypesRequests.entries()) {
+			if (request.taskId === taskId) {
+				request.reject(new TaskCancelledError(reason));
+				this.nodeTypesRequests.delete(requestId);
+			}
+		}
+
+		const controller = this.taskCancellations.get(taskId);
+		if (controller) {
+			controller.abort();
+			this.taskCancellations.delete(taskId);
+		}
+
+		if (!task.active) this.runningTasks.delete(taskId);
+
 		this.sendOffers();
 	}
 
@@ -299,18 +356,33 @@ export abstract class TaskRunner {
 			this.runningTasks.delete(taskId);
 			return;
 		}
+
+		const controller = new AbortController();
+		this.taskCancellations.set(taskId, controller);
+
+		const taskTimeout = setTimeout(() => {
+			if (!task.cancelled) {
+				controller.abort();
+				this.taskCancellations.delete(taskId);
+			}
+		}, this.taskTimeout * 1_000);
+
 		task.settings = settings;
 		task.active = true;
 		try {
-			const data = await this.executeTask(task);
+			const data = await this.executeTask(task, controller.signal);
 			this.taskDone(taskId, data);
 		} catch (error) {
-			this.taskErrored(taskId, error);
+			if (!task.cancelled) this.taskErrored(taskId, error);
+		} finally {
+			clearTimeout(taskTimeout);
+			this.taskCancellations.delete(taskId);
+			this.resetIdleTimer();
 		}
 	}
 
 	// eslint-disable-next-line @typescript-eslint/naming-convention
-	async executeTask(_task: Task): Promise<TaskResultData> {
+	async executeTask(_task: Task, _signal: AbortSignal): Promise<TaskResultData> {
 		throw new ApplicationError('Unimplemented');
 	}
 
@@ -323,6 +395,7 @@ export abstract class TaskRunner {
 		const nodeTypesPromise = new Promise<T>((resolve, reject) => {
 			this.nodeTypesRequests.set(requestId, {
 				requestId,
+				taskId,
 				resolve: resolve as (data: unknown) => void,
 				reject,
 			});
@@ -351,6 +424,7 @@ export abstract class TaskRunner {
 		const p = new Promise<T>((resolve, reject) => {
 			this.dataRequests.set(requestId, {
 				requestId,
+				taskId,
 				resolve: resolve as (data: unknown) => void,
 				reject,
 			});
@@ -432,11 +506,18 @@ export abstract class TaskRunner {
 
 	/** Close the connection gracefully and wait until has been closed */
 	async stop() {
+		this.clearIdleTimer();
+
 		this.stopTaskOffers();
 
 		await this.waitUntilAllTasksAreDone();
 
 		await this.closeConnection();
+	}
+
+	clearIdleTimer() {
+		if (this.idleTimer) clearTimeout(this.idleTimer);
+		this.idleTimer = undefined;
 	}
 
 	private async closeConnection() {

@@ -71,6 +71,9 @@ import { AddMissingPrimaryKeyOnAnnotationTagMapping1728659839644 } from '../comm
 import { UpdateProcessedDataValueColumnToText1729607673464 } from '../common/1729607673464-UpdateProcessedDataValueColumnToText';
 import { CreateTestDefinitionTable1730386903556 } from '../common/1730386903556-CreateTestDefinitionTable';
 import { AddDescriptionToTestDefinition1731404028106 } from '../common/1731404028106-AddDescriptionToTestDefinition';
+import { CreateTestMetricTable1732271325258 } from '../common/1732271325258-CreateTestMetricTable';
+import { CreateTestRun1732549866705 } from '../common/1732549866705-CreateTestRunTable';
+import { AddMockedNodesColumnToTestDefinition1733133775640 } from '../common/1733133775640-AddMockedNodesColumnToTestDefinition';
 
 export const postgresMigrations: Migration[] = [
 	InitialMigration1587669153312,
@@ -144,4 +147,7 @@ export const postgresMigrations: Migration[] = [
 	CreateTestDefinitionTable1730386903556,
 	AddDescriptionToTestDefinition1731404028106,
 	MigrateTestDefinitionKeyToString1731582748663,
+	CreateTestMetricTable1732271325258,
+	CreateTestRun1732549866705,
+	AddMockedNodesColumnToTestDefinition1733133775640,
 ];
